@@ -14,11 +14,14 @@ Scrapes NVIDIA CUDA documentation (PTX ISA, Runtime API, Driver API)
 and converts to searchable markdown format.
 """
 
+from __future__ import annotations
+
 import argparse
 import re
 import shutil
+from collections import deque
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import urldefrag, urljoin, urlparse
 
 import html2text
 import requests
@@ -1141,6 +1144,208 @@ class NsightDocsScraper(DocumentationScraper):
         print(f"  ✓ Created: {index_path}")
 
 
+class CudaGraphDocsScraper(DocumentationScraper):
+    """Scraper for NVIDIA DL CUDA Graph Best Practice for PyTorch (Sphinx / PyData theme).
+
+    Discovers every HTML page under ``/dl-cuda-graph/latest/`` by breadth-first crawl
+    from the index, then converts each page to markdown (same extraction approach as
+    :class:`ProgrammingGuideScraper` / :class:`NsightDocsScraper`).
+    """
+
+    BASE_URL = "https://docs.nvidia.com/dl-cuda-graph/latest/"
+    PATH_PREFIX = "/dl-cuda-graph/latest/"
+
+    def __init__(self, output_dir: Path, force: bool = False):
+        super().__init__(self.BASE_URL, output_dir, force=force)
+
+    def _is_doc_html(self, abs_url: str) -> bool:
+        u, _ = urldefrag(abs_url)
+        p = urlparse(u)
+        return (
+            p.scheme in ("http", "https")
+            and p.netloc == "docs.nvidia.com"
+            and p.path.startswith(self.PATH_PREFIX)
+            and p.path.endswith(".html")
+        )
+
+    def discover_pages(self) -> list[dict[str, str]]:
+        """BFS over same-site ``.html`` links starting from ``index.html``."""
+        seeds = [
+            urljoin(self.BASE_URL, "index.html"),
+            urljoin(self.BASE_URL, "search.html"),
+            urljoin(self.BASE_URL, "genindex.html"),
+        ]
+        queue: deque[str] = deque()
+        seen: set[str] = set()
+        for s in seeds:
+            if s not in seen:
+                seen.add(s)
+                queue.append(s)
+        ordered: list[dict[str, str]] = []
+
+        while queue:
+            url = queue.popleft()
+            soup = self.fetch_page(url)
+            if not soup:
+                continue
+
+            title_el = soup.find("title")
+            title = (
+                title_el.get_text(strip=True)
+                if title_el
+                else urlparse(url).path.rsplit("/", 1)[-1]
+            )
+            ordered.append({"url": url, "title": title})
+
+            for link in soup.find_all("a", href=True):
+                href = link.get("href", "")
+                if not href or href.startswith(("#", "mailto:")):
+                    continue
+                abs_url, _ = urldefrag(urljoin(url, href))
+                if not self._is_doc_html(abs_url):
+                    continue
+                if abs_url not in seen:
+                    seen.add(abs_url)
+                    queue.append(abs_url)
+
+        return ordered
+
+    def _url_to_relative_md(self, url: str) -> Path:
+        u, _ = urldefrag(url)
+        path = urlparse(u).path
+        if not path.startswith(self.PATH_PREFIX):
+            raise ValueError(f"URL not under docs prefix: {url}")
+        rel_html = path[len(self.PATH_PREFIX) :]
+        rel = rel_html.removesuffix(".html") + ".md"
+        return Path(rel)
+
+    def scrape_page(self, url: str, output_path: Path) -> bool:
+        """Scrape a single documentation page to markdown."""
+        try:
+            soup = self.fetch_page(url)
+            if not soup:
+                return False
+
+            main = (
+                soup.find("article")
+                or soup.find("div", class_="bd-article-container")
+                or soup.find("main")
+                or soup.find("body")
+            )
+            if not main:
+                return False
+
+            for nav in main.find_all(
+                ["nav", "div", "a"],
+                class_=[
+                    "prev-next-area",
+                    "bd-sidebar-primary",
+                    "bd-sidebar-secondary",
+                    "headerlink",
+                ],
+            ):
+                nav.decompose()
+            for hl in main.find_all("a", class_="headerlink"):
+                hl.decompose()
+
+            for img in main.find_all("img"):
+                src = img.get("src")
+                if src and not src.startswith(("http://", "https://")):
+                    img["src"] = urljoin(url, src)
+
+            markdown = self.h2t.handle(str(main))
+            markdown = re.sub(r"\n{4,}", "\n\n\n", markdown)
+            markdown = markdown.strip()
+
+            for marker in ["Privacy Policy", "Copyright ©", "NVIDIA-LogoBlack"]:
+                idx = markdown.find(marker)
+                if idx > 0:
+                    cut = markdown.rfind("\n", 0, idx)
+                    if cut > 0:
+                        markdown = markdown[:cut].rstrip()
+
+            header = f"---\nurl: {url}\n---\n\n"
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(header + markdown, encoding="utf-8")
+            return True
+
+        except Exception as e:
+            print(f"  ✗ Error: {e}")
+            return False
+
+    def run(self) -> None:
+        print("=" * 70)
+        print("CUDA Graph Best Practice for PyTorch (DL) — documentation scraper")
+        print(f"Source: {self.BASE_URL}")
+        print("=" * 70)
+
+        self._clean_output_if_forced()
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        print("\n1. Discovering pages (BFS)...")
+        pages = self.discover_pages()
+        print(f"   Found {len(pages)} HTML pages")
+
+        total_saved = 0
+        total_failed = 0
+        total_skipped = 0
+
+        print("\n2. Scraping to markdown...")
+        for page in pages:
+            rel = self._url_to_relative_md(page["url"])
+            out_path = self.output_dir / rel
+
+            if out_path.exists() and not self.force:
+                print(f"  ✓ Cached: {rel}")
+                total_skipped += 1
+                continue
+
+            if self.scrape_page(page["url"], out_path):
+                print(f"  ✓ Saved: {rel} ({out_path.stat().st_size:,} bytes)")
+                total_saved += 1
+            else:
+                print(f"  ✗ Failed: {rel}")
+                total_failed += 1
+
+        self._create_index(pages)
+        self._download_objects_inv()
+        print(f"\nDone: {total_saved} saved, {total_skipped} cached, {total_failed} failed")
+        print(f"Output: {self.output_dir}")
+
+    def _create_index(self, pages: list[dict[str, str]]) -> None:
+        lines = [
+            "# CUDA Graph Best Practice for PyTorch — index\n",
+            "",
+            f"Source: [{self.BASE_URL}]({self.BASE_URL})",
+            "",
+        ]
+        for page in sorted(pages, key=lambda p: self._url_to_relative_md(p["url"]).as_posix()):
+            rel = self._url_to_relative_md(page["url"]).as_posix()
+            lines.append(f"- [{page['title']}]({rel})\n")
+
+        lines.extend(["", "- [Sphinx objects.inv (cross-reference inventory)](objects.inv)\n"])
+
+        index_path = self.output_dir / "PAGE_INDEX.md"
+        index_path.write_text("\n".join(lines), encoding="utf-8")
+        print(f"  ✓ Created: {index_path}")
+
+    def _download_objects_inv(self) -> None:
+        """Sphinx inventory (symbols / cross-refs); not converted to markdown."""
+        url = urljoin(self.BASE_URL, "objects.inv")
+        target = self.output_dir / "objects.inv"
+        if target.exists() and not self.force:
+            print("  ✓ Cached: objects.inv")
+            return
+        try:
+            print(f"Fetching: {url}")
+            resp = self.session.get(url, timeout=30)
+            resp.raise_for_status()
+            target.write_bytes(resp.content)
+            print(f"  ✓ Saved: objects.inv ({len(resp.content):,} bytes)")
+        except Exception as e:
+            print(f"  ✗ objects.inv: {e}")
+
+
 PTX_SIMPLE_REPO = "https://raw.githubusercontent.com/facebookexperimental/triton/main/.claude/knowledge"
 PTX_SIMPLE_FILES = [
     "ptx-isa-arithmetic.md",
@@ -1205,7 +1410,7 @@ def main() -> None:
         "api_type",
         choices=[
             "ptx", "runtime", "driver", "ptx-simple", "guide",
-            "best-practices", "ncu-docs", "nsys-docs", "all",
+            "best-practices", "ncu-docs", "nsys-docs", "cuda-graph", "all",
         ],
         help="Documentation to scrape",
     )
@@ -1232,7 +1437,7 @@ def main() -> None:
     if args.api_type == "all":
         all_apis = [
             "ptx", "runtime", "driver", "ptx-simple", "guide",
-            "best-practices", "ncu-docs", "nsys-docs",
+            "best-practices", "cuda-graph", "ncu-docs", "nsys-docs",
         ]
         for api in all_apis:
             print(f"\n{'#' * 70}")
@@ -1247,6 +1452,10 @@ def main() -> None:
             elif api == "best-practices":
                 BestPracticesScraper(
                     refs_base / "best-practices-guide", args.force
+                ).run()
+            elif api == "cuda-graph":
+                CudaGraphDocsScraper(
+                    Path("cuda_graph_skills/references"), args.force
                 ).run()
             elif api in ("ncu-docs", "nsys-docs"):
                 NsightDocsScraper(
@@ -1278,6 +1487,11 @@ def main() -> None:
     if args.api_type in ("ncu-docs", "nsys-docs"):
         output_dir = args.output_dir or refs_base / args.api_type
         NsightDocsScraper(args.api_type, output_dir, args.force).run()
+        return
+
+    if args.api_type == "cuda-graph":
+        output_dir = args.output_dir or Path("cuda_graph_skills/references")
+        CudaGraphDocsScraper(output_dir, args.force).run()
         return
 
     # Set default output directory
