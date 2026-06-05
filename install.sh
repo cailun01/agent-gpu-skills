@@ -48,6 +48,7 @@ get_skill_dir() {
         claude) echo "${HOME}/.claude/skills" ;;
         codex)  echo "${HOME}/.codex/skills" ;;
         gemini) echo "${HOME}/.gemini/skills" ;;
+        qoder)  echo "${HOME}/.qoder/skills" ;;
         *)      echo "Unknown agent: $1" >&2; return 1 ;;
     esac
 }
